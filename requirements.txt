@@ -1,0 +1,7 @@
+duckdb==1.5.3
+earthengine-api==0.1.404
+fiona==1.9.4
+geopandas==0.14.0
+numpy==1.24.3
+pandas==2.1.1
+shapely==2.0.1

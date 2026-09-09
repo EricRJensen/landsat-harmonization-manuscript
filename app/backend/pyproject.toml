@@ -1,0 +1,33 @@
+[project]
+name = "landsat-harmonization-api"
+version = "0.1.0"
+description = "FastAPI and Earth Engine backend for the Landsat Harmonization Explorer"
+requires-python = ">=3.10"
+dependencies = [
+  "duckdb>=1.1",
+  "earthengine-api>=0.1.404",
+  "fastapi>=0.115",
+  "httpx>=0.27",
+  "numpy>=1.24,<3",
+  "pydantic-settings>=2.6",
+  "scipy>=1.13",
+  "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27", "pytest>=8.3"]
+
+[project.scripts]
+harmonization-api = "harmonization_api.main:run"
+build-coefficients = "harmonization_api.coefficient_build:main"
+build-sample-tiles = "harmonization_api.sample_tile_build:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harmonization_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
