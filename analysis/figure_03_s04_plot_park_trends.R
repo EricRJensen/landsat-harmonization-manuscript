@@ -24,8 +24,8 @@ parks <- tibble::tribble(
   "YELL", "Yellowstone", "YELL_CONUS_Poly3_Direct",
   "GRSA", "Great Sand Dunes", "GRSA_CONUS_Poly3_Direct"
 )
-strict_p <- 0.005
-loose_p <- 0.025
+strict_p <- 0.01
+loose_p <- 0.05
 masked_nlcd <- c(11, 23, 24, 31)
 
 find_raster <- function(directory, stem) {
