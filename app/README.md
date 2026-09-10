@@ -71,14 +71,23 @@ gcloud storage cp \
 app/backend/.venv/bin/build-coefficients
 ```
 
-The version-3 artifact records the source checksum, split/month rules, both independently fitted model directions, region catalogs, candidate points, coefficient equations, and held-out/binned diagnostics. It contains CONUS, Level I, Level II, Level III, HUC02, and legacy NLCD models. Empirical choices below 1,000 training pairs are marked unavailable and never silently fall back to CONUS; fallback remains only for backward-compatible dynamic map requests.
+The version-4 artifact records the source checksum, sample-selection rules, both independently fitted model directions, region catalogs, candidate points, coefficient equations, and held-out/binned diagnostics. It contains CONUS, Level I, Level II, Level III, HUC02, and legacy NLCD models. Empirical choices below 1,000 training pairs are marked unavailable and never silently fall back to CONUS; fallback remains only for backward-compatible dynamic map requests.
 
-Dashboard validation uses April–October rows with `split >= 0.7`, finite predictors, and the selected direction's target index in `[0,1]`. Every alternative for a selected region and direction is scored on identical rows. Mean bias is transformed source minus observed target, and bias improvement is the percent reduction in its absolute magnitude relative to the unharmonized baseline. Earth Engine mapping uses April–September annual medians and excludes Landsat 7 from 2022 onward.
+Coefficient fitting follows the manuscript workflow: April–October observations
+must have NLCD and Level I ecoregion values, with `split < 0.7` used for fitting.
+This gives the 3,286,393 CONUS training observations used to calculate Table 1
+and Table S5. Dashboard validation applies the corresponding `split >= 0.7`
+filter and retains observations whose unharmonized source index is in `[0,1]`,
+matching the validation calculation in
+`analysis/figure_02_s01_s03_tables_01_s05_harmonization.R`. Every alternative
+for a selected region and direction is scored on identical rows. Mean bias is
+transformed source minus observed target, and bias improvement is the percent
+reduction in its absolute magnitude relative to the unharmonized baseline.
+Earth Engine mapping uses April–September annual medians and excludes Landsat 7
+from 2022 onward.
 
-These explorer rules are intentionally broader than the manuscript's legacy,
-output-specific row profiles. The explorer artifact uses all raw training rows
-meeting its finite-value requirements; see `../REPRODUCIBILITY_NOTES.md` before
-comparing app coefficients with manuscript tables.
+The regional explorer models use the same base sample-selection rules as the
+CONUS manuscript coefficients, followed by the selected region membership.
 
 For high-traffic deployment, create a static PMTiles sample archive. This requires `tippecanoe` and the `pmtiles` CLI:
 

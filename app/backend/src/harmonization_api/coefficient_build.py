@@ -33,6 +33,11 @@ DIRECTIONS = {
     "L7_to_L8": ("L7", "L8"),
     "L8_to_L7": ("L8", "L7"),
 }
+MANUSCRIPT_SAMPLE_FILTER = (
+    "image_month BETWEEN 4 AND 10 "
+    "AND nlcd_landcover IS NOT NULL "
+    "AND ecoregion_l1_name IS NOT NULL"
+)
 
 
 def source_fingerprint(source: str) -> dict[str, Any]:
@@ -76,7 +81,7 @@ def moments_query(source: str, partition: str, direction: str) -> str:
                 {name_expression} AS group_name,
                 CASE WHEN split < 0.7 THEN 'train' ELSE 'validation' END AS phase
             FROM read_parquet('{escaped}')
-            WHERE image_month BETWEEN 4 AND 10
+            WHERE {MANUSCRIPT_SAMPLE_FILTER}
         ), long AS (
             SELECT group_id, group_name, phase, metric_family, metric, x, y
             FROM source
@@ -261,19 +266,16 @@ def _evaluation_query(
         for method in METHODS:
             branches.append(_prediction_branch(partition, index, method, partition, direction))
     expected = len(branches)
-    finite_bands = " AND ".join(
-        f"isfinite(L7_{band}) AND isfinite(L8_{band})" for band in BAND_NAMES
-    )
     return f"""
         WITH base AS MATERIALIZED (
             SELECT row_number() OVER () AS rid, CAST({group_expression} AS VARCHAR) AS group_id,
                    ({source_index})::DOUBLE AS source_index, ({target_index})::DOUBLE AS target_index,
                    {', '.join(f'{source_sensor}_{band}' for band in BAND_NAMES)}
             FROM read_parquet('{escaped}')
-            WHERE image_month BETWEEN 4 AND 10 AND split >= 0.7
-              AND {group_expression} IS NOT NULL AND {finite_bands}
+            WHERE {MANUSCRIPT_SAMPLE_FILTER} AND split >= 0.7
+              AND {group_expression} IS NOT NULL
               AND isfinite({source_index}) AND isfinite({target_index})
-              AND ({target_index}) BETWEEN 0 AND 1
+              AND ({source_index}) BETWEEN 0 AND 1
         ), predictions AS MATERIALIZED (
             {' UNION ALL '.join(branches)}
         ), valid_rows AS (
@@ -283,7 +285,8 @@ def _evaluation_query(
             HAVING count(*) = {expected} AND bool_and(isfinite(prediction))
         ), scored AS (
             SELECT p.*,
-                   CASE WHEN source_index > 0 AND source_index <= 1
+                   CASE WHEN source_index = 0 THEN 0
+                        WHEN source_index > 0 AND source_index <= 1
                         THEN least(9, CAST(ceil(source_index * 10) - 1 AS INTEGER)) END AS bin
             FROM predictions p JOIN valid_rows v USING (group_id, rid)
         )
@@ -335,7 +338,7 @@ def build_empirical_summaries(
                        ) FILTER (WHERE longitude BETWEEN -125 AND -66 AND latitude BETWEEN 24 AND 50)
                          AS candidates
                 FROM read_parquet('{escaped}')
-                WHERE image_month BETWEEN 4 AND 10 AND {group_expression} IS NOT NULL
+                WHERE {MANUSCRIPT_SAMPLE_FILTER} AND {group_expression} IS NOT NULL
                 GROUP BY group_id ORDER BY group_name, group_id
             """).fetchall()
             catalogs[partition] = [
@@ -457,7 +460,7 @@ def build_artifact(source: str, minimum_n: int = 1_000) -> dict[str, Any]:
     catalogs, evaluations = build_empirical_summaries(connection=None, source=source, models=models)
     return {
         "metadata": {
-            "schema_version": 3,
+            "schema_version": 4,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source": source_fingerprint(source),
             "directions": {
@@ -472,12 +475,19 @@ def build_artifact(source: str, minimum_n: int = 1_000) -> dict[str, Any]:
                     "mean_difference": "transformed L8 minus observed L7",
                 },
             },
-            "training_filter": "split < 0.7; image_month in 4..10",
-            "validation_filter": "split >= 0.7; image_month in 4..10",
+            "training_filter": (
+                "split < 0.7; image_month in 4..10; nonmissing NLCD and Level I ecoregion"
+            ),
+            "validation_filter": (
+                "split >= 0.7; image_month in 4..10; nonmissing NLCD and Level I ecoregion"
+            ),
             "minimum_n": minimum_n,
             "unavailable_strata_fallback": "CONUS (legacy dynamic-map workflow only)",
             "empirical_fallback_to_conus": False,
-            "evaluation_rule": "split >= 0.7; image_month in 4..10; finite predictors; target index in [0,1]",
+            "evaluation_rule": (
+                "manuscript validation filter; finite source and target indices; "
+                "unharmonized source index in [0,1]"
+            ),
             "published_benchmarks": {
                 ROY_2016_ID: {
                     "citation": "Roy et al. (2016)",
