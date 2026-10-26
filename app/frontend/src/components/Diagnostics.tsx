@@ -16,13 +16,13 @@ export function Diagnostics({ config, groupId }: { config: AnalysisConfig; group
   const forward = config.direction === "L7_to_L8";
   return <aside className={`diagnostics ${open ? "open" : ""}`}>
     <button className="diagnostics-toggle" onClick={() => setOpen(!open)}>
-      {open ? "Close diagnostics" : "Coefficient diagnostics"}
+      {open ? "Hide coefficient details" : "View coefficient details"}
     </button>
     {open && <div className="diagnostics-body">
-      <h2>Active model</h2>
+      <h2>Selected coefficients</h2>
       <p>{forward
-        ? "Coefficients transform Landsat 5/7 observations onto the Landsat 8/9 OLI-equivalent reference scale."
-        : "Coefficients transform Landsat 8/9 observations onto the Landsat 7 ETM+-equivalent reference scale."}</p>
+        ? "Coefficients adjust Landsat 5/7 observations to match OLI, the reference sensor on Landsat 8/9."
+        : "Coefficients adjust Landsat 8/9 observations to match ETM+, the reference sensor on Landsat 7."}</p>
       {error && <p className="error-message">{error}</p>}
       {data && <pre>{JSON.stringify(data, null, 2)}</pre>}
     </div>}

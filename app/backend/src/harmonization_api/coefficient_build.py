@@ -202,11 +202,14 @@ def _prediction_branch(
     method: str,
     source: str,
     direction: str,
+    coefficient_group_id: str | None = None,
 ) -> str:
     source_sensor, _ = DIRECTIONS[direction]
     family, degree_name = method.split("_")
     cubic = degree_name == "cubic"
     group_condition = "'CONUS'" if source == "conus" else "b.group_id"
+    if source != "conus" and coefficient_group_id is not None:
+        group_condition = "'" + coefficient_group_id.replace("'", "''") + "'"
     prefix = f"{source[:1]}_{method.replace('_', '')}"
     joins: list[str] = []
     if family == "index":
@@ -242,12 +245,25 @@ def _evaluation_query(
     partition: str,
     index: str,
     direction: str,
+    *,
+    coefficient_partition: str | None = None,
+    coefficient_group_id: str | None = None,
+    evaluation_group_id: str | None = None,
 ) -> tuple[str, int]:
     group_expression, _ = PARTITIONS[partition]
     escaped = source_path.replace("'", "''")
     source_sensor, target_sensor = DIRECTIONS[direction]
     source_index = SQL_INDEX_EXPRESSIONS[index](source_sensor)
     target_index = SQL_INDEX_EXPRESSIONS[index](target_sensor)
+    region_filter = ""
+    if evaluation_group_id is not None:
+        escaped_group = evaluation_group_id.replace("'", "''")
+        region_filter = f"AND CAST({group_expression} AS VARCHAR) = '{escaped_group}'"
+    if coefficient_partition is not None and coefficient_group_id is not None:
+        parent_expression, _ = PARTITIONS[coefficient_partition]
+        escaped_parent = coefficient_group_id.replace("'", "''")
+        region_filter += f" AND CAST({parent_expression} AS VARCHAR) = '{escaped_parent}'"
+    model_partition = coefficient_partition or partition
     branches = [
         "SELECT rid, group_id, source_index, target_index, 'unharmonized' AS alternative, "
         "source_index AS prediction FROM base"
@@ -264,7 +280,7 @@ def _evaluation_query(
         branches.append(_prediction_branch(partition, index, method, "conus", direction))
     if partition != "conus":
         for method in METHODS:
-            branches.append(_prediction_branch(partition, index, method, partition, direction))
+            branches.append(_prediction_branch(model_partition, index, method, model_partition, direction, coefficient_group_id))
     expected = len(branches)
     return f"""
         WITH base AS MATERIALIZED (
@@ -273,6 +289,7 @@ def _evaluation_query(
                    {', '.join(f'{source_sensor}_{band}' for band in BAND_NAMES)}
             FROM read_parquet('{escaped}')
             WHERE {MANUSCRIPT_SAMPLE_FILTER} AND split >= 0.7
+              {region_filter}
               AND {group_expression} IS NOT NULL
               AND isfinite({source_index}) AND isfinite({target_index})
               AND ({source_index}) BETWEEN 0 AND 1

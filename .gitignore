@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .venv/
+.venv-s07-s08/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -16,4 +17,7 @@ output/*
 
 app/frontend/node_modules/
 app/frontend/dist/
+app/review
+app/backend/tests/
 *.tsbuildinfo
+.playwright-cli/*

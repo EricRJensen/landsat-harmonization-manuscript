@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -8,22 +9,30 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response
 
 from . import __version__
 from .coefficients import CoefficientError, get_coefficient_store
 from .ee_pipeline import EarthEngineConfigurationError
+from .frontend import mount_frontend
 from .geocoding import search_photon
 from .published_coefficients import ROY_2016_ID, roy_models
 from .region_membership import get_region_boundary_store
+from .region_guide import router as region_guide_router
 from .sample_store import get_sample_store
+from .nested_evaluation import get_nested_evaluation_store
 from .schemas import AnalysisRequest, HarmonizationDirection, IndexName, Method, Partition, PolygonAnalysisRequest, SampleQuery, TimeseriesRequest
 from .service import format_polygon_analysis, format_timeseries, get_pipeline
 from .settings import get_settings
+from .trend_tiles import decode_scenario, descriptors, tile_url
+from .work_cache import WorkCache
+
+_pipeline_work = WorkCache(workers=1, capacity=1, ttl=3600, name="ee-init")
+_polygon_work = WorkCache(workers=2, capacity=32, ttl=1800, name="ee-area")
 
 settings = get_settings()
 api = FastAPI(title=settings.app_name, version=__version__)
+api.include_router(region_guide_router)
 api.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -37,6 +46,17 @@ def translate_error(error: Exception) -> HTTPException:
     if isinstance(error, (CoefficientError, EarthEngineConfigurationError, FileNotFoundError)):
         return HTTPException(status_code=503, detail=str(error))
     if isinstance(error, ee.EEException):
+        if "too many pixels" in str(error).lower():
+            counts = re.search(r"Found\s+([\d,]+).*?allows only\s+([\d,]+)", str(error), re.IGNORECASE)
+            size = ""
+            if counts:
+                required, limit = (int(value.replace(",", "")) for value in counts.groups())
+                size = f" This area requires {required:,} pixels; the limit is {limit:,} pixels per reduction."
+            return HTTPException(status_code=413, detail=(
+                "Your area of interest is too large to analyze at the current resolution."
+                + size + " Edit the boundary in B to select a smaller area, or analyze it in separate sections. "
+                "Time series use 30 m pixels and trend summaries use 90 m pixels; resolution is not reduced automatically."
+            ))
         return HTTPException(status_code=502, detail=f"Earth Engine error: {error}")
     return HTTPException(status_code=500, detail=str(error))
 
@@ -121,13 +141,28 @@ def evaluations(
     group_id: str,
     index: IndexName = "NDVI",
     direction: HarmonizationDirection = "L7_to_L8",
+    coefficient_partition: Partition | None = None,
+    coefficient_group_id: str | None = None,
 ) -> dict[str, Any]:
     try:
         if partition == "nlcd":
             raise HTTPException(status_code=400, detail="NLCD is not an empirical region selector")
         store = get_coefficient_store()
+        if (coefficient_partition is None) != (coefficient_group_id is None):
+            raise HTTPException(status_code=400, detail="Specify both the coefficient region type and identifier.")
+        if coefficient_partition is not None:
+            if coefficient_partition not in ("ecoregion_l1", "ecoregion_l2"):
+                raise HTTPException(status_code=400, detail="Choose Level I or Level II coefficients for a nested evaluation.")
+            descendants = get_region_boundary_store().descendants(coefficient_partition, coefficient_group_id)
+            if group_id not in descendants.get(partition, set()):
+                raise HTTPException(status_code=400, detail="The evaluation ecoregion must be within the selected coefficient ecoregion.")
         region = store.region(partition, group_id)
-        scored = store.evaluation(partition, group_id, index, direction)
+        regional_partition = coefficient_partition or partition
+        regional_group = coefficient_group_id if coefficient_group_id is not None else group_id
+        coefficient_region = store.region(regional_partition, regional_group)
+        scored = (get_nested_evaluation_store().evaluate(
+            regional_partition, regional_group, partition, group_id, index, direction,
+        ) if coefficient_partition is not None else store.evaluation(partition, group_id, index, direction))
         alternatives: list[dict[str, Any]] = [
             {
                 "id": "unharmonized", "source": "raw", "method": None,
@@ -149,7 +184,7 @@ def evaluations(
         )
         sources = [("conus", "CONUS", "CONUS")]
         if partition != "conus":
-            sources.append((partition, str(group_id), "regional"))
+            sources.append((regional_partition, str(regional_group), "regional"))
         for model_partition, model_group, label in sources:
             for method in ("band_linear", "band_cubic", "index_linear", "index_cubic"):
                 alternative_id = f"{model_partition}_{method}"
@@ -174,6 +209,7 @@ def evaluations(
             "group_id": region["id"],
             "group_name": region["name"],
             "sample_count": region["sample_count"],
+            "coefficient_region": {"partition": regional_partition, "id": coefficient_region["id"], "name": coefficient_region["name"]},
             "index": index,
             "direction": direction,
             "source_sensor": "L7" if direction == "L7_to_L8" else "L8",
@@ -268,30 +304,22 @@ def coefficients(
         raise translate_error(error) from error
 
 
+async def ready_pipeline():
+    # EE initialization makes network calls; never perform them on the event loop.
+    return await _pipeline_work.get((get_pipeline,), get_pipeline)
+
+
 @api.post("/api/v1/maps")
 async def maps(request: AnalysisRequest) -> dict[str, Any]:
     try:
-        pipeline = get_pipeline()
-        result = await run_in_threadpool(
-            pipeline.map_tiles,
-            request.partition,
-            request.method,
-            request.index,
-            request.direction,
-            request.start_year,
-            request.end_year,
-            request.significant_only,
-            (
-                request.bbox.west,
-                request.bbox.south,
-                request.bbox.east,
-                request.bbox.north,
+        # Validate configuration now; geographic map IDs are prepared lazily as
+        # the browser requests tiles, independently of the initial viewport.
+        await ready_pipeline()
+        if request.coefficient_partition:
+            get_coefficient_store().empirical_group(
+                request.coefficient_partition, request.coefficient_group_id or "CONUS", request.direction
             )
-            if request.bbox
-            else None,
-            request.coefficient_partition,
-            request.coefficient_group_id,
-        )
+        result = descriptors(request)
         result["coefficient_selection"] = {
             "partition": request.coefficient_partition,
             "group_id": request.coefficient_group_id,
@@ -304,10 +332,34 @@ async def maps(request: AnalysisRequest) -> dict[str, Any]:
         raise translate_error(error) from error
 
 
+@api.get("/api/v1/trend-tiles/{scenario}/{layer}/{z}/{x}/{y}.png")
+async def trend_tile(scenario: str, layer: str, z: int, x: int, y: int):
+    try:
+        request = decode_scenario(scenario)
+        url = await tile_url(await ready_pipeline(), request, layer, z, x, y)
+        # Serve images on the app origin. Redirected EE tile responses can omit
+        # CORS headers in browsers even when the image itself is available.
+        async with httpx.AsyncClient(timeout=180) as client:
+            upstream = await client.get(url)
+        content_type = upstream.headers.get("content-type", "").split(";", 1)[0]
+        if upstream.status_code != 200 or not content_type.startswith("image/"):
+            raise HTTPException(status_code=502, detail="Earth Engine could not render this trend tile. Please try again.")
+        return Response(upstream.content, media_type=content_type,
+                        headers={"Cache-Control": "public, max-age=3600"})
+    except HTTPException:
+        raise
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="Earth Engine trend tile request failed. Please try again.") from error
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail="Invalid trend tile request.") from error
+    except Exception as error:
+        raise translate_error(error) from error
+
+
 @api.post("/api/v1/timeseries")
 async def timeseries(request: TimeseriesRequest) -> dict[str, Any]:
     try:
-        pipeline = get_pipeline()
+        pipeline = await ready_pipeline()
         rows = await run_in_threadpool(
             pipeline.time_series,
             request.partition,
@@ -347,23 +399,17 @@ async def timeseries(request: TimeseriesRequest) -> dict[str, Any]:
 @api.post("/api/v1/polygon-analysis")
 async def polygon_analysis(request: PolygonAnalysisRequest) -> dict[str, Any]:
     try:
-        pipeline = get_pipeline()
+        pipeline = await ready_pipeline()
         coordinates = tuple(
             (float(longitude), float(latitude))
             for longitude, latitude in request.geometry.coordinates[0]
         )
-        payload = await run_in_threadpool(
-            pipeline.polygon_analysis,
-            request.partition,
-            request.method,
-            request.index,
-            request.direction,
-            request.start_year,
-            request.end_year,
-            coordinates,
-            request.coefficient_partition,
-            request.coefficient_group_id,
+        args = (
+            request.partition, request.method, request.index, request.direction,
+            request.start_year, request.end_year, coordinates,
+            request.coefficient_partition, request.coefficient_group_id,
         )
+        payload = await _polygon_work.get((pipeline, *args), lambda: pipeline.polygon_analysis(*args))
         result = format_polygon_analysis(payload)
         result["geometry"] = request.geometry.model_dump()
         result["units"] = f"{request.index} per decade"
@@ -413,25 +459,7 @@ def health() -> dict[str, Any]:
     }
 
 
-@api.get("/")
-def root() -> Any:
-    index = settings.frontend_dist / "index.html"
-    if index.is_file():
-        return FileResponse(index)
-    return {"name": settings.app_name, "docs": "/docs", "frontend": "Run npm run dev in app/frontend"}
-
-
-if settings.frontend_dist.is_dir():
-    assets = settings.frontend_dist / "assets"
-    if assets.is_dir():
-        api.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
-
-    @api.get("/{path:path}")
-    def frontend_fallback(path: str) -> FileResponse:
-        candidate = settings.frontend_dist / path
-        if candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(settings.frontend_dist / "index.html")
+mount_frontend(api, settings.frontend_dist, settings.app_name)
 
 
 def run() -> None:

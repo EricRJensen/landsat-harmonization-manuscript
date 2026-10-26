@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from functools import lru_cache
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import duckdb
 
 from .indices import SQL_INDEX_EXPRESSIONS
+from .query_limits import limit_parquet_queries
 from .schemas import SampleQuery
 from .settings import get_settings
 
@@ -57,6 +60,8 @@ def derived_cte(source: str) -> str:
 class SampleStore:
     def __init__(self, source: str):
         self.source = source
+        self._config_lock = Lock()
+        self._config: dict[str, Any] | None = None
         if not source.startswith(("http://", "https://", "gs://")) and not Path(source).is_file():
             raise FileNotFoundError(f"Sample parquet not found: {source}")
 
@@ -66,6 +71,15 @@ class SampleStore:
         return connection
 
     def config(self) -> dict[str, Any]:
+        # The paired dataset is fixed for a deployment. Share its metadata scan
+        # across requests, including concurrent first visits; failures can retry.
+        with self._config_lock:
+            if self._config is None:
+                self._config = self._load_config()
+            return deepcopy(self._config)
+
+    @limit_parquet_queries
+    def _load_config(self) -> dict[str, Any]:
         connection = self._connection()
         try:
             cte = derived_cte(self.source)
@@ -105,6 +119,7 @@ class SampleStore:
         finally:
             connection.close()
 
+    @limit_parquet_queries
     def query(self, request: SampleQuery, limit: int) -> dict[str, Any]:
         bbox = request.bbox
         clauses = [

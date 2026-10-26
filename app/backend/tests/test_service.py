@@ -1,4 +1,16 @@
-from harmonization_api.service import format_polygon_analysis, format_timeseries
+import pytest
+
+from harmonization_api.service import format_polygon_analysis, format_timeseries, trend_summary
+
+
+def test_trend_summary_loads_statistics_when_needed() -> None:
+    rows = [{"year": year, "raw": 0.2 + 0.01 * (year - 2000)} for year in range(2000, 2010)]
+    result = trend_summary(rows, "raw")
+    assert result["n"] == 10
+    assert result["slope"] == pytest.approx(0.01)
+    assert result["intercept"] == pytest.approx(-19.8)
+    assert result["tau"] == pytest.approx(1)
+    assert result["p_value"] == pytest.approx(2 / 3_628_800)
 
 
 def test_format_timeseries_does_not_mutate_cached_rows() -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Event
 
 import duckdb
 import pytest
@@ -46,3 +48,82 @@ def test_individual_sample_offsets_and_dates(tmp_path: Path) -> None:
     assert properties["ndvi_offset"] == pytest.approx(
         (0.64 - 0.22) / (0.64 + 0.22) - (0.6 - 0.2) / (0.6 + 0.2)
     )
+
+
+def test_config_reuses_scan_and_returns_independent_metadata(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "samples.parquet"
+    make_sample(source)
+    store = SampleStore(str(source))
+    connect = store._connection
+    calls = []
+
+    def counted_connection():
+        calls.append(1)
+        return connect()
+
+    monkeypatch.setattr(store, "_connection", counted_connection)
+    first = store.config()
+    second = store.config()
+
+    assert first == second
+    assert calls == [1]
+    assert second["rows"] == 1
+    assert second["year_min"] == second["year_max"] == 2018
+    assert second["month_min"] == second["month_max"] == 7
+    assert second["offset_definition"] == "L8 - L7"
+    assert set(second["offset_ranges"]) == {"NDVI", "EVI", "MSAVI"}
+    assert second["categories"] == {
+        "ecoregion_l1": ["8"], "ecoregion_l2": ["9.1"],
+        "ecoregion_l3": ["1"], "huc02": ["01"], "nlcd": ["71"],
+    }
+    first["categories"]["huc02"].append("02")
+    first["offset_ranges"]["NDVI"][0] = 999
+    assert store.config() == second
+
+
+def test_concurrent_config_requests_share_one_scan(monkeypatch) -> None:
+    store = SampleStore("https://example.test/samples.parquet")
+    workers = 8
+    ready = Barrier(workers)
+    entered, release = Event(), Event()
+    calls = []
+
+    def load():
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+        return {"rows": 42, "categories": {"huc02": ["01"]}}
+
+    def request():
+        ready.wait(timeout=5)
+        return store.config()
+
+    monkeypatch.setattr(store, "_load_config", load)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(request) for _ in range(workers)]
+        try:
+            assert entered.wait(5)
+        finally:
+            release.set()
+        results = [future.result(timeout=5) for future in futures]
+    assert calls == [1]
+    assert results == [{"rows": 42, "categories": {"huc02": ["01"]}}] * workers
+    assert len({id(result) for result in results}) == workers
+
+
+def test_config_failure_can_retry(monkeypatch) -> None:
+    store = SampleStore("https://example.test/samples.parquet")
+    calls = []
+
+    def load():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("temporary read failure")
+        return {"rows": 42}
+
+    monkeypatch.setattr(store, "_load_config", load)
+    with pytest.raises(OSError, match="temporary read failure"):
+        store.config()
+    assert store.config() == {"rows": 42}
+    assert store.config() == {"rows": 42}
+    assert len(calls) == 2

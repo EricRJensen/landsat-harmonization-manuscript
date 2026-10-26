@@ -1,18 +1,25 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import * as echarts from "echarts";
+import type { ReactNode } from "react";
+import type * as echarts from "echarts";
+import { ChartCanvas } from "./ChartCanvas";
 import { api } from "../api";
+import { SelectedCoefficients } from "./SelectedCoefficients";
+import { RegionGuide } from "./RegionGuide";
+import { useWorkflowNavigation } from "../useWorkflowNavigation";
+import "../exploreGuidance.css";
 import type {
   EvaluationAlternative,
   EvaluationResponse,
   HarmonizationChoice,
   HarmonizationDirection,
   IndexName,
+  NestedEcoregion,
   Partition,
   RegionSummary,
 } from "../types";
 
 const REGION_TYPES: Array<{ id: Partition; label: string; detail: string }> = [
-  { id: "conus", label: "CONUS", detail: "One model fitted across all contiguous U.S. samples" },
+  { id: "conus", label: "CONUS", detail: "Coefficients fitted across the conterminous U.S." },
   { id: "ecoregion_l1", label: "Level I", detail: "10 broad ecological regions" },
   { id: "ecoregion_l2", label: "Level II", detail: "20 ecological regions" },
   { id: "ecoregion_l3", label: "Level III", detail: "85 detailed ecological regions" },
@@ -29,20 +36,20 @@ const DIRECTIONS: Array<{
     id: "L7_to_L8",
     label: "Use OLI as reference",
     notation: "L7 → L8",
-    detail: "Transform Landsat 5/7; leave Landsat 8/9 unchanged.",
+    detail: "Adjust Landsat 5/7 observations to match OLI, the reference sensor on Landsat 8/9.",
   },
   {
     id: "L8_to_L7",
     label: "Use ETM+ as reference",
     notation: "L8 → L7",
-    detail: "Transform Landsat 8/9; leave Landsat 5/7 unchanged.",
+    detail: "Adjust Landsat 8/9 observations to match ETM+, the reference sensor on Landsat 7.",
   },
 ];
 
 const METHOD_DETAILS: Record<string, { title: string; fit: string }> = {
-  band_linear: { title: "Band-level", fit: "Linear fit" },
+  band_linear: { title: "Band-level", fit: "Linear" },
   band_cubic: { title: "Band-level", fit: "Third-order polynomial (P3)" },
-  index_linear: { title: "Index-level", fit: "Linear fit" },
+  index_linear: { title: "Index-level", fit: "Linear" },
   index_cubic: { title: "Index-level", fit: "Third-order polynomial (P3)" },
   unharmonized: { title: "Unharmonized", fit: "No transformation" },
 };
@@ -65,7 +72,7 @@ const COLORS: Record<string, string> = {
   band_cubic: "#9e9ac8",
   index_linear: "#1b9e77",
   index_cubic: "#66c2a4",
-  unharmonized: "#d95f02",
+  unharmonized: "#59636e",
   roy_2016_band_ols: "#2563b8",
 };
 
@@ -112,83 +119,156 @@ function equation(metric: string, coefficients: number[], direction: Harmonizati
 }
 
 function MiniChart({ option, ariaLabel }: { option: echarts.EChartsOption; ariaLabel: string }) {
-  const element = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!element.current) return;
-    const chart = echarts.init(element.current);
-    chart.setOption(option);
-    const observer = new ResizeObserver(() => chart.resize());
-    observer.observe(element.current);
-    return () => { observer.disconnect(); chart.dispose(); };
-  }, [option]);
-  return <div ref={element} className="metric-chart" role="img" aria-label={ariaLabel} />;
+  return <ChartCanvas option={option} className="metric-chart" ariaLabel={ariaLabel} />;
 }
 
-function ComparisonCharts({ evaluation }: { evaluation: EvaluationResponse }) {
-  const panels = evaluation.partition === "conus" ? ["CONUS"] : ["CONUS", "regional"];
+function ComparisonPanel({ evaluation, selectedId, source, title, children, pending, subtitle }: {
+  evaluation: EvaluationResponse; selectedId: string; source: "CONUS" | "regional";
+  title: string; children?: ReactNode; pending?: ReactNode; subtitle?: ReactNode;
+}) {
   const raw = evaluation.alternatives.find((item) => item.id === "unharmonized");
   const roy = evaluation.alternatives.find((item) => item.id === ROY_2016_ID && item.available);
   const sourceLabel = evaluation.source_sensor === "L7" ? "ETM+" : "OLI";
+  const models = evaluation.alternatives.filter((item) => item.source === source && item.available);
+  const alternatives = [...(raw ? [raw] : []), ...(roy ? [roy] : []), ...models];
+  const categoryLabels = alternatives.map(alternativeLabel);
+  const barData = (metric: "rmse" | "mean_difference") => alternatives.map((item) => ({
+    value: item.metrics?.[metric],
+    itemStyle: { color: alternativeColor(item), borderColor: "#292535", borderWidth: item.id === selectedId ? 2 : 0 },
+  }));
+  const maxAbsoluteBias = Math.max(
+    ...alternatives.map((item) => Math.abs(item.metrics?.mean_difference ?? 0)),
+    0.001,
+  );
+  const biasPadding = maxAbsoluteBias * 1.12;
+  const biasStep = 10 ** (Math.floor(Math.log10(biasPadding)) - 1);
+  const biasLimit = Math.ceil(biasPadding / biasStep) * biasStep;
+  const rmseOption: echarts.EChartsOption = {
+    animation: false,
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    grid: { left: 52, right: 12, top: 12, bottom: 72 },
+    xAxis: { type: "category", data: categoryLabels, axisLabel: { rotate: 35 } },
+    yAxis: { type: "value", name: "RMSE", min: 0 },
+    series: [{ type: "bar", data: barData("rmse") }],
+  };
+  const biasOption: echarts.EChartsOption = {
+    animation: false,
+    tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
+    grid: { left: 60, right: 12, top: 12, bottom: 72 },
+    xAxis: { type: "category", data: categoryLabels, axisLabel: { rotate: 35 } },
+    yAxis: {
+      type: "value", name: "Mean bias", min: -biasLimit, max: biasLimit,
+      axisLine: { show: true },
+      axisLabel: { formatter: (value: number) => Number(value.toPrecision(3)).toString() },
+    },
+    series: [{ type: "bar", data: barData("mean_difference") }],
+  };
+  const binLabels = Array.from({ length: 10 }, (_, i) => `(${(i / 10).toFixed(1)},${((i + 1) / 10).toFixed(1)}]`);
+  const binOption: echarts.EChartsOption = {
+    animation: false,
+    tooltip: { trigger: "axis" },
+    legend: { show: false },
+    grid: { left: 56, right: 12, top: 28, bottom: 100 },
+    xAxis: {
+      type: "category", data: binLabels, name: `Unharmonized ${sourceLabel} ${evaluation.index} bin`,
+      nameLocation: "middle", nameGap: 72,
+      axisLine: { onZero: false }, axisLabel: { rotate: 45 },
+    },
+    yAxis: { type: "value", name: "Mean bias", scale: true },
+    series: alternatives.map((item) => ({
+      name: item.id === "unharmonized" ? "Unharmonized" : item.id === ROY_2016_ID ? "Roy et al. (2016)" : METHOD_LABELS[item.method!],
+      type: "line", symbolSize: item.id === selectedId ? 7 : 5, connectNulls: false,
+      lineStyle: { width: item.id === selectedId ? 4 : 2 },
+      color: alternativeColor(item),
+      data: item.metrics?.bins.map((bin) => bin.mean_difference) ?? [],
+    })),
+  };
+  return <section className="comparison-panel">
+    <header className="comparison-panel-header"><h3>{title}</h3>{children}</header>
+    {subtitle && <p className="comparison-panel-subtitle" role="status">{subtitle}</p>}
+    {pending || <>
+    <ul className="comparison-chart-key" aria-label="Chart method key">{alternatives.map((item) => <li key={item.id} className={item.id === selectedId ? "selected" : ""}>
+      <span style={{ background: alternativeColor(item) }} aria-hidden="true" />
+      <span><strong>{alternativeLabel(item)}</strong> = {item.id === "unharmonized" ? "Unharmonized" : item.id === ROY_2016_ID ? "Roy et al. (2016)" : METHOD_LABELS[item.method!]}{item.id === selectedId && " · selected"}</span>
+    </li>)}</ul>
+    <div className="metric-chart-grid">
+      <div><h4>Held-out RMSE</h4><MiniChart option={rmseOption} ariaLabel={`${source} RMSE comparison`} /></div>
+      <div><h4>Held-out mean bias</h4><MiniChart option={biasOption} ariaLabel={`${source} mean bias comparison`} /></div>
+      <div><h4>Mean bias across the index range</h4><MiniChart option={binOption} ariaLabel={`${source} binned mean bias`} /></div>
+    </div>
+    <details className="chart-data-details"><summary>Read chart values as tables</summary>
+      <div className="table-scroll" tabIndex={0} role="region" aria-label={`${source} overall evaluation values`}><table>
+        <caption>Held-out evaluation in {evaluation.group_name}</caption>
+        <thead><tr><th>Approach</th><th>Paired observations</th><th>RMSE</th><th>Mean bias</th></tr></thead>
+        <tbody>{alternatives.map((item) => <tr key={item.id}><th scope="row">{item.id === "unharmonized" ? "Unharmonized" : item.id === ROY_2016_ID ? "Roy et al. (2016)" : METHOD_LABELS[item.method!]}{item.id === selectedId && " (selected)"}</th><td>{item.metrics?.n.toLocaleString()}</td><td>{format(item.metrics?.rmse, 6)}</td><td>{format(item.metrics?.mean_difference, 6)}</td></tr>)}</tbody>
+      </table></div>
+      <div className="table-scroll" tabIndex={0} role="region" aria-label={`${source} mean bias by index range`}><table>
+        <caption>Mean bias by unharmonized {sourceLabel} {evaluation.index} range</caption>
+        <thead><tr><th>Index range</th>{alternatives.map((item) => <th key={item.id}>{alternativeLabel(item)}</th>)}</tr></thead>
+        <tbody>{binLabels.map((label, i) => <tr key={label}><th scope="row">{label}</th>{alternatives.map((item) => <td key={item.id}>{format(item.metrics?.bins[i]?.mean_difference, 6)}</td>)}</tr>)}</tbody>
+      </table></div>
+    </details>
+    </>}
+  </section>;
+}
+
+function ComparisonCharts({ evaluation, selectedId }: { evaluation: EvaluationResponse; selectedId: string }) {
+  const canExploreChildren = evaluation.partition === "ecoregion_l1" || evaluation.partition === "ecoregion_l2";
+  const [regions, setRegions] = useState<NestedEcoregion[]>([]);
+  const [regionsError, setRegionsError] = useState("");
+  const [regionKey, setRegionKey] = useState("");
+  const [result, setResult] = useState<{ key: string; data: EvaluationResponse } | null>(null);
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
+  const selectedRegion = regions.find(region => `${region.partition}:${region.id}` === regionKey);
+
+  useEffect(() => {
+    if (!canExploreChildren) return;
+    const controller = new AbortController();
+    setRegionsError("");
+    void api.childEcoregions(evaluation.partition, evaluation.group_id, controller.signal)
+      .then(response => { if (!controller.signal.aborted) setRegions(response.regions); })
+      .catch(reason => { if (!controller.signal.aborted) setRegionsError((reason as Error).message); });
+    return () => controller.abort();
+  }, [evaluation.partition, evaluation.group_id, canExploreChildren, retry]);
+
+  useEffect(() => {
+    if (!selectedRegion) return;
+    const controller = new AbortController();
+    setError("");
+    void api.nestedEvaluation(evaluation, selectedRegion, controller.signal)
+      .then(data => { if (!controller.signal.aborted) setResult({ key: regionKey, data }); })
+      .catch(reason => { if (!controller.signal.aborted) setError((reason as Error).message); });
+    return () => controller.abort();
+  }, [evaluation, selectedRegion, regionKey, retry]);
+
+  const nested = regionKey && result?.key === regionKey ? result.data : null;
+  const pairs = nested?.alternatives.find(item => item.id === "unharmonized")?.metrics?.n ?? 0;
+  const displayedPairs = regionKey ? nested && !error ? pairs : null
+    : evaluation.alternatives.find(item => item.id === "unharmonized")?.metrics?.n;
+  const pending = regionKey && (error
+    ? <p className="nested-evaluation-feedback" role="alert">{error} <button type="button" className="text-button" onClick={() => { setError(""); setRetry(value => value + 1); }}>Retry</button></p>
+    : !nested ? <p className="nested-evaluation-feedback" role="status">Evaluating {evaluation.group_name} coefficients in {selectedRegion?.name}…</p>
+    : !pairs ? <p className="nested-evaluation-feedback" role="status">No comparable held-out observations are available in this ecoregion for {evaluation.index}. Choose another ecoregion.</p> : null);
+
   return <div className="comparison-panels">
-    {panels.map((source) => {
-      const models = evaluation.alternatives.filter((item) => item.source === source && item.available);
-      const alternatives = [...(raw ? [raw] : []), ...(roy ? [roy] : []), ...models];
-      const categoryLabels = alternatives.map(alternativeLabel);
-      const barData = (metric: "rmse" | "mean_difference") => alternatives.map((item) => ({
-        value: item.metrics?.[metric],
-        itemStyle: { color: alternativeColor(item) },
-      }));
-      const maxAbsoluteBias = Math.max(
-        ...alternatives.map((item) => Math.abs(item.metrics?.mean_difference ?? 0)),
-        0.001,
-      );
-      const biasPadding = maxAbsoluteBias * 1.12;
-      const biasStep = 10 ** (Math.floor(Math.log10(biasPadding)) - 1);
-      const biasLimit = Math.ceil(biasPadding / biasStep) * biasStep;
-      const rmseOption: echarts.EChartsOption = {
-        animation: false,
-        tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
-        grid: { left: 52, right: 12, top: 12, bottom: 72 },
-        xAxis: { type: "category", data: categoryLabels, axisLabel: { rotate: 35 } },
-        yAxis: { type: "value", name: "RMSE", min: 0 },
-        series: [{ type: "bar", data: barData("rmse") }],
-      };
-      const biasOption: echarts.EChartsOption = {
-        animation: false,
-        tooltip: { trigger: "axis", axisPointer: { type: "shadow" } },
-        grid: { left: 60, right: 12, top: 12, bottom: 72 },
-        xAxis: { type: "category", data: categoryLabels, axisLabel: { rotate: 35 } },
-        yAxis: {
-          type: "value", name: "Mean bias", min: -biasLimit, max: biasLimit,
-          axisLine: { show: true },
-          axisLabel: { formatter: (value: number) => Number(value.toPrecision(3)).toString() },
-        },
-        series: [{ type: "bar", data: barData("mean_difference") }],
-      };
-      const binLabels = Array.from({ length: 10 }, (_, i) => `(${(i / 10).toFixed(1)},${((i + 1) / 10).toFixed(1)}]`);
-      const binOption: echarts.EChartsOption = {
-        animation: false,
-        tooltip: { trigger: "axis" },
-        legend: { top: 0, type: "scroll" },
-        grid: { left: 56, right: 12, top: 48, bottom: 78 },
-        xAxis: { type: "category", data: binLabels, name: `Unharmonized ${sourceLabel} ${evaluation.index} bin`, axisLabel: { rotate: 45 } },
-        yAxis: { type: "value", name: "Mean bias", scale: true },
-        series: alternatives.map((item) => ({
-          name: alternativeLabel(item),
-          type: "line", symbolSize: 5, connectNulls: false,
-          color: alternativeColor(item),
-          data: item.metrics?.bins.map((bin) => bin.mean_difference) ?? [],
-        })),
-      };
-      return <section className="comparison-panel" key={source}>
-        <h3>{source === "CONUS" ? "CONUS coefficients" : `${evaluation.group_name} coefficients`}</h3>
-        <div className="metric-chart-grid">
-          <div><h4>Held-out RMSE</h4><MiniChart option={rmseOption} ariaLabel={`${source} RMSE comparison`} /></div>
-          <div><h4>Held-out mean bias</h4><MiniChart option={biasOption} ariaLabel={`${source} mean bias comparison`} /></div>
-          <div><h4>Mean bias by source-index bin</h4><MiniChart option={binOption} ariaLabel={`${source} binned mean bias`} /></div>
-        </div>
-      </section>;
-    })}
+    <ComparisonPanel evaluation={evaluation} selectedId={selectedId} source="CONUS" title="CONUS coefficients" />
+    {evaluation.partition !== "conus" && <ComparisonPanel evaluation={nested ?? evaluation} selectedId={selectedId}
+      source="regional" title={`${evaluation.group_name} coefficients`} pending={pending}
+      subtitle={canExploreChildren && <>Coefficients fitted in {evaluation.group_name}{displayedPairs != null && <> · {displayedPairs.toLocaleString()} held-out pairs</>}</>}>
+      {canExploreChildren && <div className="nested-evaluation-control">
+        <label><span>Evaluate within</span>
+          <select value={regionKey} disabled={!regions.length} onChange={event => { setResult(null); setError(""); setRegionKey(event.target.value); }}>
+            <option value="">Entire {evaluation.group_name}</option>
+            {(["ecoregion_l2", "ecoregion_l3"] as const).map(level => regions.some(region => region.partition === level) &&
+              <optgroup key={level} label={level === "ecoregion_l2" ? "Level II ecoregions" : "Level III ecoregions"}>
+                {regions.filter(region => region.partition === level).map(region => <option key={region.id} value={`${region.partition}:${region.id}`}>Level {level === "ecoregion_l2" ? "II" : "III"} · {region.name}</option>)}
+              </optgroup>)}
+          </select>
+        </label>
+        {regionsError && <p role="alert">{regionsError} <button type="button" className="text-button" onClick={() => setRetry(value => value + 1)}>Retry</button></p>}
+      </div>}
+    </ComparisonPanel>}
   </div>;
 }
 
@@ -201,12 +281,13 @@ interface Props {
     selectedId?: string;
   };
   onUse: (choice: HarmonizationChoice) => Promise<void>;
+  onSelectionChange?: (choice: HarmonizationChoice | null) => void;
 }
 
-export function ExploreWorkflow({ initial, onUse }: Props) {
+export function ExploreWorkflow({ initial, onUse, onSelectionChange }: Props) {
   const [partition, setPartition] = useState<Partition>(initial?.partition ?? "conus");
   const [regions, setRegions] = useState<RegionSummary[]>([]);
-  const [groupId, setGroupId] = useState(initial?.groupId ?? "CONUS");
+  const [groupId, setGroupId] = useState(initial?.groupId ?? (initial?.partition && initial.partition !== "conus" ? "" : "CONUS"));
   const [index, setIndex] = useState<IndexName>(initial?.index ?? "NDVI");
   const [direction, setDirection] = useState<HarmonizationDirection>(initial?.direction ?? "L7_to_L8");
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
@@ -220,6 +301,9 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
   const contextSection = useRef<HTMLElement>(null);
   const comparisonSection = useRef<HTMLElement>(null);
   const diagnosticsSection = useRef<HTMLElement>(null);
+  const workflowSections = useMemo(() => [contextSection, comparisonSection, diagnosticsSection], []);
+  const { currentSection, goToSection } = useWorkflowNavigation(workflowSections);
+  const [navigationMessage, setNavigationMessage] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -229,7 +313,7 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
       setRegions(next);
       setGroupId((current) => {
         const requested = partition === "conus" ? "CONUS" : current;
-        return next.some((item) => item.id === requested) ? requested : (next[0]?.id ?? "");
+        return next.some((item) => item.id === requested) ? requested : "";
       });
     }).catch((reason: Error) => {
       if (active) setError(reason.message);
@@ -240,7 +324,11 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
   }, [partition]);
 
   useEffect(() => {
-    if (!groupId) return;
+    if (!groupId) {
+      ++evaluationRequest.current;
+      setEvaluation(null); setLoadingEvaluation(false); setSelectedId("");
+      return;
+    }
     const controller = new AbortController();
     const requestId = ++evaluationRequest.current;
     setLoadingEvaluation(true);
@@ -287,14 +375,17 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
   const royAlternative = evaluation?.alternatives.find((item) => item.id === ROY_2016_ID);
   const rawRmse = rawAlternative?.metrics?.rmse;
   const rawBias = rawAlternative?.metrics?.mean_difference;
-  const choice = selected && selected.method && evaluation ? {
+  const choice = useMemo(() => selected && selected.method && evaluation && !loadingEvaluation ? {
     partition,
     groupId,
     groupName: evaluation.group_name,
     index,
     direction,
     alternative: selected,
-  } satisfies HarmonizationChoice : null;
+  } satisfies HarmonizationChoice : null, [selected, evaluation, loadingEvaluation, partition, groupId, index, direction]);
+  useEffect(() => {
+    onSelectionChange?.(contextConfirmed ? choice : null);
+  }, [choice, contextConfirmed, onSelectionChange]);
   const searchableRegions = useMemo(() => regions, [regions]);
   const tableGroups = evaluation ? [
     {
@@ -302,20 +393,23 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
       alternatives: evaluation.alternatives.filter((item) => item.source === "raw"),
     },
     {
-      id: "conus", title: "CONUS coefficients", detail: "Fitted across all CONUS training samples",
+      id: "conus", title: "CONUS coefficients",
+      detail: `Fitted across all CONUS training samples; applied and evaluated on held-out observations ${evaluation.partition === "conus" ? "across CONUS" : `only within ${evaluation.group_name}`}.`,
       alternatives: evaluation.alternatives.filter((item) => item.source === "CONUS"),
     },
     ...(evaluation.partition === "conus" ? [] : [{
-      id: "regional", title: `${evaluation.group_name} coefficients`, detail: "Fitted only within the selected region",
+      id: "regional", title: `${evaluation.group_name} coefficients`,
+      detail: `Fitted using training samples within ${evaluation.group_name}; applied and evaluated on held-out observations from the same region.`,
       alternatives: evaluation.alternatives.filter((item) => item.source === "regional"),
     }]),
   ] : [];
   const sourceName = direction === "L7_to_L8" ? "ETM+" : "OLI";
   const targetName = direction === "L7_to_L8" ? "OLI" : "ETM+";
-  const comparisonLoading = loadingRegions || loadingEvaluation || !evaluationIsCurrent;
+  const comparisonLoading = loadingRegions || loadingEvaluation || Boolean(groupId && !evaluationIsCurrent);
 
   const changeContext = (change: () => void) => {
-    setSelectedId("");
+    onSelectionChange?.(null);
+    setContextConfirmed(false); setSelectedId(""); setNavigationMessage("");
     change();
   };
 
@@ -330,47 +424,48 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
   const confirmContext = () => {
     if (!evaluationIsCurrent || comparisonLoading) return;
     setContextConfirmed(true);
-    window.requestAnimationFrame(() => comparisonSection.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    window.requestAnimationFrame(() => goToSection(1));
   };
 
   const editContext = () => {
+    onSelectionChange?.(null);
     setContextConfirmed(false);
-    window.requestAnimationFrame(() => contextSection.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    window.requestAnimationFrame(() => goToSection(0));
   };
 
   return <div className="explore-workflow">
     <nav className="workflow-progress" aria-label="Analysis workflow progress">
-      <button type="button" className={contextConfirmed ? "summary" : "active"}
-        aria-current={!contextConfirmed ? "step" : undefined}
-        onClick={() => contextSection.current?.scrollIntoView({ behavior: "smooth", block: "start" })}>
-        <span>A</span><strong>Define context</strong><small>Direction, region, index</small>
+      <button type="button" data-step="one" className={`${contextConfirmed ? "summary" : "ready"} ${currentSection === 0 ? "active" : ""}`}
+        aria-current={currentSection === 0 ? "step" : undefined} onClick={() => goToSection(0)}>
+        <span>A</span><strong>Choose inputs</strong><small>{contextConfirmed ? "Confirmed · edit available" : "Reference sensor, region, index"}</small>
       </button>
-      <button type="button" className={!contextConfirmed ? "locked" : choice ? "complete" : "active"}
-        aria-current={contextConfirmed && !choice ? "step" : undefined}
-        onClick={() => comparisonSection.current?.scrollIntoView({ behavior: "smooth", block: "start" })}>
-        <span>B</span><strong>Compare &amp; choose</strong><small>Select one validated approach</small>
+      <button type="button" data-step="two" className={`${!contextConfirmed ? "locked" : choice ? "complete" : "ready"} ${currentSection === 1 ? "active" : ""}`}
+        aria-current={currentSection === 1 ? "step" : undefined} aria-disabled={!contextConfirmed}
+        onClick={() => { if (contextConfirmed) goToSection(1); else setNavigationMessage("Confirm your choices in A to compare approaches in B."); }}>
+        <span>B</span><strong>Compare &amp; choose</strong><small>{!contextConfirmed ? "First confirm A" : choice ? "Approach selected" : "Select an approach"}</small>
       </button>
-      <button type="button" className={contextConfirmed ? "ready" : "locked"}
-        aria-current={contextConfirmed && Boolean(choice) ? "step" : undefined}
-        onClick={() => diagnosticsSection.current?.scrollIntoView({ behavior: "smooth", block: "start" })}>
-        <span>C</span><strong>Inspect performance</strong><small>Bias and error diagnostics</small>
+      <button type="button" data-step="three" className={`${contextConfirmed ? "ready" : "locked"} ${currentSection === 2 ? "active" : ""}`}
+        aria-current={currentSection === 2 ? "step" : undefined} aria-disabled={!contextConfirmed}
+        onClick={() => { if (contextConfirmed) goToSection(2); else setNavigationMessage("Confirm your choices in A to open the optional performance review in C."); }}>
+        <span>C</span><strong>Review performance</strong><small>{contextConfirmed ? "Optional · index-range bias" : "Optional · first confirm A"}</small>
       </button>
     </nav>
+    {navigationMessage && <div className="workflow-navigation-message" role="status">{navigationMessage}<button type="button" onClick={() => { setNavigationMessage(""); goToSection(0); }}>Go to choices</button></div>}
 
-    <section ref={contextSection} className={`workflow-step step-one ${contextConfirmed ? "context-summary-mode" : ""}`}>
+    <section ref={contextSection} tabIndex={-1} className={`workflow-step step-one ${contextConfirmed ? "context-summary-mode" : ""}`}
+      title={contextConfirmed ? "Click 'Edit choices' in the top-right to modify these selections" : undefined}>
       <header className="step-header">
         <div className="step-number">A</div>
-        <div><p className="eyebrow">Define the application context</p><h2>Choose a reference scale, region, and index</h2>
-          <p>Each choice updates every approach against the same held-out paired observations, so the comparison remains fair and application-specific.</p></div>
-        {contextConfirmed ? <div className="context-step-actions">
-          <span className="step-status">Choices confirmed</span>
+        <div><p className="eyebrow">Define harmonization details</p><h2>Choose a reference sensor, region, and index</h2>
+          <p>Compare approaches using paired observations from your selected region. Evaluation uses held-out observations that were not used to fit the coefficients.</p></div>
+        {contextConfirmed && <div className="context-step-actions">
           <button type="button" className="secondary-button edit-choices-button" onClick={editContext}>Edit choices</button>
-        </div> : evaluationIsCurrent && !loadingEvaluation && <span className="step-status">Context ready</span>}
+        </div>}
       </header>
 
       <fieldset className="context-fields" disabled={contextConfirmed}>
         <section className="direction-stage" aria-labelledby="direction-heading">
-          <div className="selection-prompt"><span>1</span><div><strong id="direction-heading">Which sensor scale should the merged record use?</strong><p>Direction determines which sensor family is transformed and which remains the reference.</p></div></div>
+          <div className="selection-prompt"><span>1</span><div><strong id="direction-heading">Choose the reference sensor</strong><p>Choose the sensor whose observations you want to retain as your reference. Harmonization adjusts the other sensor family; reference observations remain unchanged. Neither direction is universally preferable.</p></div></div>
           <div className="direction-picker" role="radiogroup" aria-label="Harmonization direction">
             {DIRECTIONS.map((item) => <button key={item.id} type="button" role="radio"
               aria-checked={direction === item.id} className={direction === item.id ? "active" : ""}
@@ -382,8 +477,8 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
         </section>
 
         <div className="selection-stage">
-          <div className="selection-prompt"><span>2</span><div><strong>Choose a geographic framework</strong><p>Compare CONUS coefficients with models fitted within an ecological or watershed region.</p></div></div>
-          <section className="region-picker" aria-label="Region hierarchy">
+          <div className="selection-prompt"><span>2</span><div><strong>Choose a region type</strong><p>Start with a CONUS-wide comparison, or evaluate whether an ecological or watershed region better represents your area of interest.</p></div></div>
+          <section className="region-picker" aria-label="Region type">
             {REGION_TYPES.map((item) => <button key={item.id} className={partition === item.id ? "active" : ""}
               aria-pressed={partition === item.id}
               onClick={() => changeContext(() => {
@@ -397,21 +492,24 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
 
         <div className="guided-selection-grid">
           <section className="guided-field">
-            <div className="selection-prompt"><span>3</span><div><strong>Choose the evaluation region</strong><p>{partition === "conus" ? "CONUS uses every eligible paired ETM+/OLI sample." : "All approaches use the same held-out pairs from this region."}</p></div></div>
-            {partition !== "conus" ? <label>Named region
-              <select className="region-search" value={groupId} disabled={loadingRegions || !groupId}
-                onChange={(event) => changeContext(() => setGroupId(event.target.value))} aria-label="Search or choose a region">
+            <div className="selection-prompt"><span>3</span><div><strong>Choose the evaluation region</strong><p>{partition === "conus" ? "Evaluate approaches on held-out observations across CONUS." : "All approaches are evaluated on the same held-out observations within this region."}</p></div></div>
+            {partition !== "conus" ? <label>Region
+              <select className="region-search" value={groupId} disabled={loadingRegions}
+                onChange={(event) => changeContext(() => setGroupId(event.target.value))} aria-label="Choose an evaluation region">
+                <option value="">{loadingRegions ? "Loading regions…" : "Choose a region…"}</option>
                 {searchableRegions.map((region) =>
                   <option key={region.id} value={region.id}>{region.name} · {region.sample_count.toLocaleString()} samples</option>)}
               </select>
-            </label> : <div className="locked-selection"><span>Selected region</span><strong>All CONUS pixels</strong></div>}
+            </label> : <div className="locked-selection"><span>Selected region</span><strong>Conterminous U.S. (CONUS)</strong></div>}
+            {partition !== "conus" && <RegionGuide key={partition} partition={partition} groupId={groupId}
+              groupName={regions.find((region) => region.id === groupId)?.name} />}
           </section>
 
           <section className="guided-field">
-            <div className="selection-prompt"><span>4</span><div><strong>Choose the vegetation index</strong><p>Residual bias and the best correction can vary by index and across its value range.</p></div></div>
+            <div className="selection-prompt"><span>4</span><div><strong>Choose the vegetation index</strong><p>Choose the vegetation index used in your evaluation.</p></div></div>
             <div className="index-picker" aria-label="Vegetation index">
               {([
-                ["NDVI", "Greenness · saturates at high values"], ["EVI", "Greenness · resists saturation"], ["MSAVI", "Greenness · reduces soil influence"],
+                ["NDVI", "Normalized difference vegetation index"], ["EVI", "Enhanced vegetation index"], ["MSAVI", "Modified soil-adjusted vegetation index"],
               ] as Array<[IndexName, string]>).map(([name, detail]) => <button key={name}
                 className={index === name ? "active" : ""} aria-pressed={index === name}
                 onClick={() => changeContext(() => setIndex(name))}><strong>{name}</strong><span>{detail}</span></button>)}
@@ -421,39 +519,43 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
       </fieldset>
 
       {error && <div className="error-banner" role="alert">{error}</div>}
-      {(loadingRegions || (loadingEvaluation && !evaluation)) && <div className="loading-panel compact" role="status">Preparing the held-out comparison…</div>}
+      {(loadingRegions || (loadingEvaluation && !evaluation)) && <div className="loading-panel compact" role="status">Loading the held-out comparison…</div>}
       {!contextConfirmed && <div className="context-confirmation">
-        <div><strong>Ready to compare approaches?</strong><span>Confirm these choices to unlock the coefficient comparison and diagnostic plots.</span></div>
+        <div><strong>Next: Compare harmonization approaches</strong><span>Review bias and error for your selected reference sensor, region, and vegetation index, then choose an approach in Panel B.</span></div>
         <button type="button" className="primary-button" onClick={confirmContext}
           disabled={!evaluationIsCurrent || comparisonLoading || !groupId}>
-          {comparisonLoading ? "Preparing comparison…" : "Confirm choices"}
+          {comparisonLoading ? "Loading comparison…" : !groupId ? "Choose a region to continue" : "Compare approaches →"}
         </button>
       </div>}
     </section>
 
     {evaluation && <>
-      <section ref={comparisonSection} className={`workflow-step step-two ${contextConfirmed ? "" : "is-locked"}`}
+      <section ref={comparisonSection} tabIndex={-1} className={`workflow-step step-two ${contextConfirmed ? "" : "is-locked"}`}
         aria-busy={comparisonLoading} aria-disabled={!contextConfirmed} inert={!contextConfirmed}>
         <header className="step-header">
           <div className="step-number">B</div>
-          <div><p className="eyebrow">Select one validated approach</p><h2>Compare harmonization strategies</h2>
-            <p>Choose directly from the method tables. Lower RMSE means less total paired-sample error; mean bias closest to zero means less systematic sensor offset.</p></div>
-          {choice ? <span className="step-status">Method selected</span> : <span className="step-status action-status">Selection needed</span>}
+          <div><p className="eyebrow">Select an approach</p><h2>Compare harmonization approaches</h2>
+            <p>Evaluate the harmonization approaches below by comparing their bias and error on held-out observations. Select an approach for further analysis, then continue to Map & Analyze to explore its effects on vegetation trends and time series.</p></div>
         </header>
 
+        <div className="method-decision-guide">
+          <p><strong>Band-level</strong> approaches adjust surface reflectance before calculating the index. <strong>Index-level</strong> approaches adjust the chosen index directly.</p>
+          <p><strong>Linear or third-order polynomial?</strong> Compare held-out error and bias for your application. A more flexible polynomial does not guarantee better performance across the index range.</p>
+        </div>
         <div className="comparison-content">
           {comparisonLoading && <div className="comparison-updating" role="status"><span className="loading-spinner" />Updating this comparison…</div>}
           <div className="baseline-benchmark">
-            <div><span>Unharmonized benchmark</span><strong>{sourceName} observations compared with {targetName}</strong><small>{rawAlternative?.metrics?.n.toLocaleString() ?? "—"} held-out pairs in {evaluation.group_name}</small></div>
+            <div><span>Unharmonized baseline</span><strong>{sourceName} observations compared with {targetName}</strong><small>{rawAlternative?.metrics?.n.toLocaleString() ?? "—"} held-out pairs in {evaluation.group_name}</small></div>
             <dl><div><dt>RMSE</dt><dd>{format(rawRmse)}</dd></div><div><dt>Mean bias</dt><dd>{format(rawBias)}</dd></div></dl>
+            <p className="metric-definition">Improvements indicated in the table(s) below are relative to the unharmonized baseline provided here: positive values indicate lower RMSE or lower absolute bias; negative values indicate an increase. Roy et al. (2016) is a published benchmark for comparison.</p>
           </div>
 
           <div className="strategy-scope-grid" role="radiogroup" aria-label="Harmonization approaches">
             {tableGroups.filter((group) => group.id !== "raw").map((group) => {
               const alternatives = [...(royAlternative ? [royAlternative] : []), ...group.alternatives];
               return <section className="strategy-scope" key={group.id}>
-              <header><div><span>{group.id === "conus" ? "Broad model" : "Local model"}</span><h3>{group.title}</h3><p>{group.detail}</p></div></header>
-              <div className="method-choice-table-wrap"><table className="method-choice-table" aria-label={`${group.title} harmonization approaches`}>
+              <header><div><span>{group.id === "conus" ? "CONUS fit" : "Regional fit"}</span><h3>{group.title}</h3><p>{group.detail}</p></div></header>
+              <div className="method-choice-table-wrap"><table className="method-choice-table" role="table" aria-label={`${group.title} harmonization approaches`}>
                 <thead><tr><th>Approach</th><th>RMSE</th><th>Mean bias</th><th>RMSE improvement</th><th>Bias improvement</th><th>Choice</th></tr></thead>
                 <tbody>{alternatives.map((alternative) => {
                   const rmseImprovement = rawRmse && alternative.metrics
@@ -469,11 +571,11 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
                     className={`${isSelected ? "selected" : ""} ${!alternative.available ? "unavailable" : ""} ${isPublished ? "published-reference" : ""}`}
                     onClick={() => { if (!isPublished && alternative.available && !comparisonLoading) setSelectedId(alternative.id); }}>
                     <td className="method-choice-title"><div><strong>{method.title}</strong><small>{method.fit}</small></div></td>
-                    <td>{format(alternative.metrics?.rmse)}</td>
-                    <td>{format(alternative.metrics?.mean_difference)}</td>
-                    <td className="metric-improvement">{signedPercent(rmseImprovement)}</td>
-                    <td className="metric-improvement">{signedPercent(biasImprovement)}</td>
-                    <td>{isPublished ? <span className="published-reference-label">Published reference</span> : <label className="method-choice-action">
+                    <td data-label="RMSE">{format(alternative.metrics?.rmse)}</td>
+                    <td data-label="Mean bias">{format(alternative.metrics?.mean_difference)}</td>
+                    <td data-label="RMSE improvement" className="metric-improvement">{signedPercent(rmseImprovement)}</td>
+                    <td data-label="Bias improvement" className="metric-improvement">{signedPercent(biasImprovement)}</td>
+                    <td className="method-selection-cell">{isPublished ? <span className="published-reference-label">Published reference</span> : <label className="method-choice-action">
                       <input type="radio" name="harmonization-approach" value={alternative.id}
                         checked={isSelected} disabled={!alternative.available || comparisonLoading || !contextConfirmed}
                         aria-label={`${group.title}: ${method.title}, ${method.fit}`}
@@ -486,9 +588,19 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
             </section>})}
           </div>
 
+          <section className={`choice-summary ${choice ? "ready" : ""} ${contextConfirmed ? "" : "is-locked"}`}
+        aria-disabled={!contextConfirmed} inert={!contextConfirmed}>
+        {choice ? <>
+          <div><p className="eyebrow">Selected approach</p><h2>{coefficientScopeLabel(choice.alternative.source)} · {METHOD_LABELS[choice.alternative.method!]}</h2>
+            <p>Evaluated in {choice.groupName} · {choice.index} · {sourceName}→{targetName} · RMSE {format(choice.alternative.metrics?.rmse)} · mean bias {format(choice.alternative.metrics?.mean_difference)}</p></div>
+          <button className="primary-button continue-button" onClick={() => void apply()} disabled={applying || !contextConfirmed}>{applying ? "Opening the map…" : "Continue to Map & Analyze →"}</button>
+          <SelectedCoefficients choice={choice} compact />
+        </> : <><div><p className="eyebrow">Choose an approach to continue</p><h2>Select one approach in the tables above</h2><p>The map will use your selected reference sensor, index, and coefficient set.</p></div><span className="choice-arrow" aria-hidden="true">↑</span></>}
+      </section>
+
           <details className="evidence-details">
-            <summary>Inspect equations and the complete metrics table</summary>
-            <p>These details support reproducibility; method selection is made with the comparison tables above.</p>
+            <summary>View equations and all evaluation metrics</summary>
+            <p>Band-level approaches adjust reflectance before calculating the index. Index-level approaches adjust the index directly. Equations are shown for the selected reference sensor.</p>
             <div className="table-scroll"><table className="coefficient-table">
               <thead><tr><th>Approach</th><th>Equation(s)</th><th>RMSE</th><th>Mean bias</th><th>RMSE improvement</th><th>Bias improvement</th></tr></thead>
               <tbody>{[...tableGroups, ...(royAlternative ? [{
@@ -504,10 +616,10 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
                     <td>{alternative.id === ROY_2016_ID ? "Roy et al. (2016) · Band-level OLS" : alternative.method ? METHOD_LABELS[alternative.method] : "No harmonization"}{!alternative.available && <small>Unavailable</small>}</td>
                     <td className="equations">{alternative.models ? Object.entries(alternative.models).map(([metric, model]) =>
                       <div key={metric}>{equation(metric, model.coefficients, evaluation.direction)}</div>) : "—"}</td>
-                    <td>{format(alternative.metrics?.rmse)}</td>
-                    <td>{format(alternative.metrics?.mean_difference)}</td>
-                    <td className="metric-improvement">{signedPercent(rmseImprovement)}</td>
-                    <td className="metric-improvement">{signedPercent(biasImprovement)}</td>
+                    <td data-label="RMSE">{format(alternative.metrics?.rmse)}</td>
+                    <td data-label="Mean bias">{format(alternative.metrics?.mean_difference)}</td>
+                    <td data-label="RMSE improvement" className="metric-improvement">{signedPercent(rmseImprovement)}</td>
+                    <td data-label="Bias improvement" className="metric-improvement">{signedPercent(biasImprovement)}</td>
                   </tr>;
                 })}
               </Fragment>)}</tbody>
@@ -517,25 +629,18 @@ export function ExploreWorkflow({ initial, onUse }: Props) {
         </div>
       </section>
 
-      <section ref={diagnosticsSection} className={`workflow-step step-three ${contextConfirmed ? "" : "is-locked"}`}
+      <section ref={diagnosticsSection} tabIndex={-1} className={`workflow-step step-three ${contextConfirmed ? "" : "is-locked"}`}
         aria-busy={loadingEvaluation} aria-disabled={!contextConfirmed} inert={!contextConfirmed}>
         <header className="step-header">
           <div className="step-number">C</div>
-          <div><p className="eyebrow">Optional deeper review</p><h2>Inspect performance across the index range</h2>
-            <p>Use these plots to identify tail behavior and tradeoffs that a single average metric can hide. You can return to the method tables at any time.</p></div>
+          <div><p className="eyebrow">Optional review</p><h2>Review performance across the index range</h2>
+            <p>Check whether an approach reduces bias across low and high index values. An average metric can hide differences within the range.</p></div>
         </header>
-        <p className="metric-definition">Mean bias is transformed {sourceName} minus observed {targetName}; bins use the unharmonized {sourceName} index. Bias improvement measures reduction in absolute systematic bias relative to the unharmonized baseline.</p>
-        <ComparisonCharts evaluation={evaluation} />
+        <p className="metric-definition">Mean bias is the adjusted {sourceName} value minus the observed {targetName} value; the baseline uses unharmonized values. Observations are grouped by their unharmonized {sourceName} index.</p>
+        <ComparisonCharts key={`${evaluation.partition}:${evaluation.group_id}:${evaluation.index}:${evaluation.direction}`} evaluation={evaluation} selectedId={selectedId} />
       </section>
 
-      <section className={`choice-summary ${choice ? "ready" : ""} ${contextConfirmed ? "" : "is-locked"}`}
-        aria-live="polite" aria-disabled={!contextConfirmed} inert={!contextConfirmed}>
-        {choice ? <>
-          <div><p className="eyebrow">Ready for Earth Engine analysis</p><h2>{coefficientScopeLabel(choice.alternative.source)} · {METHOD_LABELS[choice.alternative.method!]}</h2>
-            <p>{choice.groupName} · {choice.index} · {sourceName}→{targetName} · RMSE {format(choice.alternative.metrics?.rmse)} · mean bias {format(choice.alternative.metrics?.mean_difference)}</p></div>
-          <button className="primary-button continue-button" onClick={() => void apply()} disabled={applying || !contextConfirmed}>{applying ? "Choosing a regional map point…" : "Continue to maps & time series →"}</button>
-        </> : <><div><p className="eyebrow">Next action</p><h2>Select one approach in the tables above</h2><p>Your selection carries the exact direction, coefficient scope, method, region, and index into Tab 2.</p></div><span className="choice-arrow" aria-hidden="true">↑</span></>}
-      </section>
+
     </>}
   </div>;
 }

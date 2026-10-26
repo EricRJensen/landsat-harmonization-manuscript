@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
 import type { FeatureCollection } from "geojson";
-import type { GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
+import type { ExpressionSpecification, GeoJSONSource, Map as MapLibreMap } from "maplibre-gl";
 import { api } from "../api";
 import { baseStyle, LABEL_LAYER_ID } from "../mapStyle";
-import type { BasemapMode, GeoJsonFeatureCollection, IndexName, Partition } from "../types";
+import type { BasemapMode, GeoJsonFeatureCollection, IndexName } from "../types";
+
+const OFFSET_COLORS = { negative: "#b2182b", zero: "#f7f7f7", positive: "#2166ac" };
+
+function offsetColorExpression(range: [number, number]): ExpressionSpecification {
+  return ["interpolate", ["linear"], ["get", "offset"],
+    range[0], OFFSET_COLORS.negative, 0, OFFSET_COLORS.zero, range[1], OFFSET_COLORS.positive];
+}
 
 function formatNumber(value: unknown, digits = 5) {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
@@ -20,11 +28,11 @@ function popupContent(properties: Record<string, unknown>): HTMLElement {
   root.className = "sample-popup";
   const title = document.createElement("strong");
   title.textContent = properties.kind === "aggregate"
-    ? `${Number(properties.sample_count).toLocaleString()} paired samples`
-    : `Paired sample · ${properties.image_year}`;
+    ? `${Number(properties.sample_count).toLocaleString()} paired observations`
+    : `Paired observation · ${properties.image_year}`;
   root.append(title);
   const rows: Array<[string, string]> = properties.kind === "aggregate"
-    ? [["Mean displayed offset", formatNumber(properties.offset)]]
+    ? [["Mean index difference (OLI − ETM+)", formatNumber(properties.offset)]]
     : [
         ["ETM+ acquisition", acquisitionDate(properties.l7_date)],
         ["OLI acquisition", acquisitionDate(properties.l8_date)],
@@ -56,17 +64,11 @@ function popupContent(properties: Record<string, unknown>): HTMLElement {
 interface Props {
   basemap: BasemapMode;
   selectedIndex?: IndexName;
-  selectedPartition?: Partition;
-  selectedGroupId?: string;
-  lockedRegion?: boolean;
 }
 
 export function SampleMap({
   basemap,
   selectedIndex = "NDVI",
-  selectedPartition = "conus",
-  selectedGroupId = "",
-  lockedRegion = false,
 }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -75,21 +77,18 @@ export function SampleMap({
   const [index, setIndex] = useState<IndexName>(selectedIndex);
   const [year, setYear] = useState<string>("");
   const [month, setMonth] = useState<string>("");
-  const [partition, setPartition] = useState<Partition>(selectedPartition);
-  const [category, setCategory] = useState(selectedPartition === "conus" ? "" : selectedGroupId);
-  const [categories, setCategories] = useState<Record<string, string[]>>({});
   const [ranges, setRanges] = useState<Record<string, [number, number]>>({});
   const [range, setRange] = useState<[number, number]>([-0.1, 0.1]);
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
   const [metadata, setMetadata] = useState<GeoJsonFeatureCollection["metadata"] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.sampleConfig().then((config) => {
-      setCategories(config.categories as Record<string, string[]>);
       const availableRanges = config.offset_ranges as Record<string, [number, number]>;
       setRanges(availableRanges);
-      if (availableRanges?.NDVI) setRange(availableRanges.NDVI);
     }).catch((reason: Error) => setError(reason.message));
   }, []);
 
@@ -109,8 +108,8 @@ export function SampleMap({
         index,
         year: year ? Number(year) : null,
         month: month ? Number(month) : null,
-        partition,
-        category: category || null,
+        partition: "conus",
+        category: null,
       }, controller.signal);
       (map.getSource("samples") as GeoJSONSource | undefined)?.setData({
         type: "FeatureCollection",
@@ -122,7 +121,7 @@ export function SampleMap({
     } finally {
       if (abortRef.current === controller) setLoading(false);
     }
-  }, [index, year, month, partition, category]);
+  }, [index, year, month]);
   refreshRef.current = () => { void refresh(); };
 
   useEffect(() => {
@@ -136,8 +135,8 @@ export function SampleMap({
         filter: ["==", ["get", "kind"], "aggregate"],
         paint: {
           "circle-radius": ["interpolate", ["linear"], ["get", "sample_count"], 1, 4, 500, 8, 15000, 20],
-          "circle-color": ["interpolate", ["linear"], ["get", "offset"], range[0], "#a6611a", 0, "#f5f5f5", range[1], "#5e3c99"],
-          "circle-opacity": 0.82, "circle-stroke-color": "#172326", "circle-stroke-width": 0.5,
+          "circle-color": offsetColorExpression(rangeRef.current),
+          "circle-opacity": 1, "circle-stroke-color": "#172326", "circle-stroke-width": 0.5,
         },
       }, map.getLayer(LABEL_LAYER_ID) ? LABEL_LAYER_ID : undefined);
       map.addLayer({
@@ -145,8 +144,8 @@ export function SampleMap({
         filter: ["==", ["get", "kind"], "sample"],
         paint: {
           "circle-radius": ["interpolate", ["linear"], ["zoom"], 8, 2, 13, 5],
-          "circle-color": ["interpolate", ["linear"], ["get", "offset"], range[0], "#a6611a", 0, "#f5f5f5", range[1], "#5e3c99"],
-          "circle-opacity": 0.8, "circle-stroke-color": "#172326", "circle-stroke-width": 0.35,
+          "circle-color": offsetColorExpression(rangeRef.current),
+          "circle-opacity": 1, "circle-stroke-color": "#172326", "circle-stroke-width": 0.35,
         },
       }, map.getLayer(LABEL_LAYER_ID) ? LABEL_LAYER_ID : undefined);
       refreshRef.current();
@@ -178,28 +177,23 @@ export function SampleMap({
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { setIndex(selectedIndex); }, [selectedIndex]);
-  useEffect(() => {
-    setPartition(selectedPartition);
-    setCategory(selectedPartition === "conus" ? "" : selectedGroupId);
-  }, [selectedPartition, selectedGroupId]);
   useEffect(() => { if (ranges[index]) setRange(ranges[index]); }, [index, ranges]);
   useEffect(() => {
     const map = mapRef.current;
     if (!map?.getLayer("sample-points")) return;
     for (const layer of ["sample-points", "sample-aggregates"]) {
-      map.setPaintProperty(layer, "circle-color", ["interpolate", ["linear"], ["get", "offset"], range[0], "#a6611a", 0, "#f5f5f5", range[1], "#5e3c99"]);
+      map.setPaintProperty(layer, "circle-color", offsetColorExpression(range));
     }
   }, [range]);
 
-  const partitionCategories = categories[partition] ?? [];
   return <div className="sample-layout">
     <section className="control-card sample-controls">
       <div>
         <p className="eyebrow">Paired observations</p>
         <h2>Near-coincident ETM+–OLI observations</h2>
-        <p>Offsets are OLI minus ETM+ for acquisitions one day apart. Zoom in to inspect individual paired samples.</p>
+        <p>Colors show OLI minus ETM+ for observations collected one day apart. Positive values indicate higher OLI values. Zoom in and hover over a point to inspect the pair.</p>
       </div>
-      <label>Color by index
+      <label>Vegetation index
         <select value={index} onChange={(event) => setIndex(event.target.value as IndexName)}>
           {(["NDVI", "EVI", "MSAVI"] as IndexName[]).map((item) => <option key={item}>{item}</option>)}
         </select>
@@ -214,21 +208,12 @@ export function SampleMap({
           {[4, 5, 6, 7, 8, 9, 10].map((item) => <option key={item} value={item}>{new Date(2000, item - 1).toLocaleString("en", { month: "short" })}</option>)}
         </select>
       </label>
-      {!lockedRegion && <label>Partition filter
-        <select value={partition} onChange={(event) => { setPartition(event.target.value as Partition); setCategory(""); }}>
-          <option value="conus">None</option><option value="ecoregion_l1">Level I ecoregion</option><option value="ecoregion_l2">Level II ecoregion</option>
-          <option value="ecoregion_l3">Level III ecoregion</option><option value="huc02">HUC02</option><option value="nlcd">NLCD class</option>
-        </select>
-      </label>}
-      {!lockedRegion && partition !== "conus" && <label>Category
-        <select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All categories</option>
-          {partitionCategories.map((item) => <option key={item}>{item}</option>)}
-        </select>
-      </label>}
       <div className="offset-range">
-        <span>{range[0]?.toFixed(3)}</span><div className="legend-ramp" /><span>{range[1]?.toFixed(3)}</span>
+        <span>{range[0]?.toFixed(3)}</span><div className="legend-ramp" style={{
+          background: `linear-gradient(90deg, ${OFFSET_COLORS.negative} 0%, ${OFFSET_COLORS.zero} ${100 * -range[0] / (range[1] - range[0])}%, ${OFFSET_COLORS.positive} 100%)`,
+        }} /><span>{range[1]?.toFixed(3)}</span>
       </div>
-      <small>{loading ? "Loading visible samples…" : metadata ? `${metadata.mode === "aggregate" ? "Aggregates" : "Points"} loaded${metadata.truncated ? " · viewport capped" : ""}` : "Move the map to load samples"}</small>
+      <small>{loading ? "Loading paired observations…" : metadata ? `${metadata.mode === "aggregate" ? "Grouped observations" : "Individual pairs"} loaded${metadata.truncated ? " · sample limit reached; zoom in for more detail" : ""}` : "Move the map to load paired observations"}</small>
       {error && <p className="error-message">{error}</p>}
     </section>
     <section className="map-card sample-map-card"><div ref={container} className="map-surface" /></section>

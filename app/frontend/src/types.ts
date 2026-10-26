@@ -22,7 +22,22 @@ export interface MapBounds {
   north: number;
 }
 
+export interface MapCamera {
+  longitude: number;
+  latitude: number;
+  zoom: number;
+  bearing?: number;
+  pitch?: number;
+}
+
+export interface PolygonDraft {
+  vertices: number[][];
+  closed: boolean;
+}
+
 export interface TileDescriptor {
+  minzoom?: number;
+  maxzoom?: number;
   url: string;
   min: number;
   max: number;
@@ -44,6 +59,12 @@ export interface RegionSummary {
   sample_count: number;
   training_count: number;
   validation_count: number;
+}
+
+export interface NestedEcoregion {
+  partition: "ecoregion_l2" | "ecoregion_l3";
+  id: string;
+  name: string;
 }
 
 export interface BinMetric {
@@ -83,6 +104,7 @@ export interface EvaluationAlternative {
 }
 
 export interface EvaluationResponse {
+  coefficient_region?: { partition: Partition; id: string; name: string };
   partition: Partition;
   group_id: string;
   group_name: string;

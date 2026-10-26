@@ -4,9 +4,6 @@ from collections import defaultdict
 from functools import lru_cache
 from typing import Any
 
-import numpy as np
-from scipy.stats import kendalltau, theilslopes
-
 from .coefficients import get_coefficient_store
 from .ee_pipeline import LandsatPipeline
 from .settings import get_settings
@@ -21,6 +18,11 @@ def trend_summary(values: list[dict[str, Any]], value_key: str) -> dict[str, Any
     valid = [(int(item["year"]), item.get(value_key)) for item in values if item.get(value_key) is not None]
     if len(valid) < 8:
         return None
+    # Statistical summaries are needed only after an area analysis. Keep their
+    # imports off the initial page/API startup path.
+    import numpy as np
+    from scipy.stats import kendalltau, theilslopes
+
     years = np.array([item[0] for item in valid], dtype=float)
     observations = np.array([item[1] for item in valid], dtype=float)
     slope = theilslopes(observations, years)

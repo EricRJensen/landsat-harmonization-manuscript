@@ -28,6 +28,8 @@ SENSOR_END_EXCLUSIVE = {
     "L5": "2012-01-01",
     "L7": "2022-01-01",
 }
+# First April–September season available in Collection 2 Tier 1 Level 2.
+SENSOR_FIRST_SEASON = {"L5": 1984, "L7": 1999, "L8": 2013, "L9": 2022}
 NLCD_ASSET = "projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER"
 MIN_OBSERVATIONS = 8
 CONUS_BOUNDS = (-125.0, 24.0, -66.0, 50.0)
@@ -427,7 +429,6 @@ class LandsatPipeline:
             "palette": palette,
         }
 
-    @lru_cache(maxsize=32)
     def map_tiles(
         self,
         partition: str,
@@ -440,47 +441,46 @@ class LandsatPipeline:
         bounds: tuple[float, float, float, float] | None = None,
         fixed_partition: str | None = None,
         fixed_group_id: str | None = None,
+        layers: tuple[str, ...] = ("raw", "harmonized", "difference"),
     ) -> dict[str, Any]:
-        # Build and composite the source archive once. The old implementation
-        # constructed independent raw and harmonized 40-year graphs, doubling
-        # the Landsat archive fanout and exceeding EE's interactive memory limit.
-        analysis_bounds = bounds or CONUS_BOUNDS
-        geometry = ee.Geometry.Rectangle(analysis_bounds, geodesic=False)
-        annual, _ = self.annual_collections(
-            partition,
-            method,
-            index,
-            direction,
-            start_year,
-            end_year,
-            geometry=geometry,
-            fixed_partition=fixed_partition,
-            fixed_group_id=fixed_group_id,
+        requested = set(layers)
+        if not requested or not requested <= {"raw", "harmonized", "difference"}:
+            raise ValueError("Invalid map layers")
+        # Each visible layer can finish independently. Do not build the
+        # difference graph until its modal requests tiles.
+        geometry = ee.Geometry.Rectangle(bounds or CONUS_BOUNDS, geodesic=False)
+        output = "raw" if requested == {"raw"} else "harm" if requested == {"harmonized"} else "both"
+        collection = self.merged_collection(
+            partition, method, index, direction, start_year, end_year, output,
+            geometry, fixed_partition, fixed_group_id,
         )
-        raw_trend = self.trend(annual, "raw", "raw", significant_only)
-        harm_trend = self.trend(annual, "harm", "harm", significant_only)
-        # Present trends per decade to match the scientific figures while the
-        # underlying Theil–Sen regression remains in index units per year.
-        raw = raw_trend.select("raw_slope").multiply(10).clip(geometry)
-        harm = harm_trend.select("harm_slope").multiply(10).clip(geometry)
-        difference = harm.subtract(raw).rename("difference_slope")
-        if significant_only:
-            raw = raw.updateMask(raw_trend.select("raw_p").lte(0.05))
-            harm = harm.updateMask(harm_trend.select("harm_p").lte(0.05))
-            difference = difference.updateMask(
-                raw_trend.select("raw_p").lte(0.05).And(harm_trend.select("harm_p").lte(0.05))
-            )
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                "raw": executor.submit(self._tile, raw, -0.05, 0.05),
-                "harmonized": executor.submit(self._tile, harm, -0.05, 0.05),
-                "difference": executor.submit(self._tile, difference, -0.03, 0.03),
-            }
-            tiles = {name: future.result() for name, future in futures.items()}
+        annual = self.annual(collection, start_year, end_year,
+                             ("value",) if output != "both" else ("raw", "harm"))
+        images = {}
+        if requested & {"raw", "difference"}:
+            raw_trend = self.trend(annual, "value" if output == "raw" else "raw", "raw", significant_only)
+            raw = raw_trend.select("raw_slope").multiply(10)
+            images["raw"] = raw.updateMask(raw_trend.select("raw_p").lte(.05)) if significant_only else raw
+        if requested & {"harmonized", "difference"}:
+            harm_trend = self.trend(annual, "value" if output == "harm" else "harm", "harm", significant_only)
+            harm = harm_trend.select("harm_slope").multiply(10)
+            images["harmonized"] = harm.updateMask(harm_trend.select("harm_p").lte(.05)) if significant_only else harm
+        if "difference" in requested:
+            # Subtracting the masked sources preserves the intersection of
+            # significant pixels used by the existing difference map.
+            images["difference"] = images["harmonized"].subtract(images["raw"]).rename("difference_slope")
+        if len(requested) == 1:
+            name = layers[0]
+            limit = .03 if name == "difference" else .05
+            tiles = {name: self._tile(images[name], -limit, limit)}
+        else:
+            with ThreadPoolExecutor(max_workers=len(requested)) as executor:
+                futures = {name: executor.submit(self._tile, images[name], -.03 if name == "difference" else -.05,
+                                                 .03 if name == "difference" else .05) for name in layers}
+                tiles = {name: future.result() for name, future in futures.items()}
         return {
             **tiles,
             "units": f"{index} per decade",
-            "bounds": analysis_bounds,
             "fixed_coefficients": fixed_partition is not None,
         }
 
@@ -553,10 +553,11 @@ class LandsatPipeline:
             reducer=ee.Reducer.mean(),
             geometry=geometry,
             scale=30,
-            maxPixels=20_000_000,
+            maxPixels=200_000_000,
             tileScale=4,
-        ).getInfo()
-        scene_counts = annual.aggregate_array("scene_count").getInfo()
+        )
+        payload = ee.Dictionary({"values": values, "counts": annual.aggregate_array("scene_count")}).getInfo()
+        values, scene_counts = payload["values"], payload["counts"]
         return [
             {
                 "series": series,
@@ -596,11 +597,16 @@ class LandsatPipeline:
             annual, geometry, "merged", ["raw", "harm"], start_year, end_year
         )
         for sensor, collection in sensors.items():
-            rows.extend(
-                self._mean_rows(
-                    collection, geometry, sensor, ["raw", "harm"], start_year, end_year
-                )
-            )
+            first = max(start_year, SENSOR_FIRST_SEASON[sensor])
+            last = min(end_year, int(SENSOR_END_EXCLUSIVE.get(sensor, f"{end_year + 1}-01-01")[:4]) - 1)
+            active = collection.filter(ee.Filter.gte("year", first)).filter(ee.Filter.lte("year", last))
+            # The public polygon response only displays raw sensor records;
+            # harmonized values are needed only for the merged record.
+            measured = {row["year"]: row for row in self._mean_rows(
+                active, geometry, sensor, ["raw"], first, last
+            )} if first <= last else {}
+            rows.extend(measured.get(year, {"series": sensor, "year": year, "scene_count": 0, "raw": None})
+                        for year in range(start_year, end_year + 1))
 
         raw_trend = self.trend(annual, "raw", "raw")
         harm_trend = self.trend(annual, "harm", "harm")
@@ -614,7 +620,7 @@ class LandsatPipeline:
                 ),
                 geometry=geometry,
                 scale=90,
-                maxPixels=2_000_000,
+                maxPixels=20_000_000,
                 tileScale=4,
             )
             boxplot = ee.Dictionary({
@@ -639,7 +645,7 @@ class LandsatPipeline:
                 reducer=ee.Reducer.frequencyHistogram(),
                 geometry=geometry,
                 scale=90,
-                maxPixels=2_000_000,
+                maxPixels=20_000_000,
                 tileScale=4,
             ).get("class")
             # Resolve one source at a time to prevent Earth Engine from

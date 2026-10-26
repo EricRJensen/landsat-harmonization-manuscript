@@ -77,6 +77,50 @@ class RegionBoundaryStore:
                 return True
         return False
 
+    def region_features(self, partition: Partition) -> list[dict[str, Any]]:
+        """Boundary geometry and catalog identifiers, without altering stored artifacts."""
+        if partition in ("conus", "nlcd"):
+            return []
+        filename, field = ("huc02.geojson", "huc2") if partition == "huc02" else (
+            "ecoregions.geojson", ECOREGION_FIELDS[partition]
+        )
+        return [
+            {
+                "type": "Feature",
+                "properties": {"group_id": str(feature.get("properties", {}).get(field, "")).strip()},
+                "geometry": feature["geometry"],
+            }
+            for feature in self._load(filename)
+            if feature.get("geometry")
+        ]
+
+    def locate(self, partition: Partition, longitude: float, latitude: float) -> list[str]:
+        """Use the source boundaries, not simplified display geometry, for lookup."""
+        return sorted({
+            feature["properties"]["group_id"]
+            for feature in self.region_features(partition)
+            if _geometry_contains(feature["geometry"], longitude, latitude)
+        })
+
+    def descendants(self, partition: Partition, group_id: str) -> dict[str, set[str]]:
+        """Use explicit hierarchy attributes; Level III codes are not parent prefixes."""
+        levels = {
+            "ecoregion_l1": ("ecoregion_l2", "ecoregion_l3"),
+            "ecoregion_l2": ("ecoregion_l3",),
+        }.get(partition, ())
+        children: dict[str, set[str]] = {level: set() for level in levels}
+        if not levels:
+            return children
+        for feature in self._load("ecoregions.geojson"):
+            properties = feature.get("properties", {})
+            if str(properties.get(ECOREGION_FIELDS[partition], "")).strip() != group_id:
+                continue
+            for level in levels:
+                code = str(properties.get(ECOREGION_FIELDS[level], "")).strip()
+                if code:
+                    children[level].add(code)
+        return children
+
 
 @lru_cache
 def get_region_boundary_store() -> RegionBoundaryStore:
